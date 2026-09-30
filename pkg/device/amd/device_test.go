@@ -594,3 +594,40 @@ func TestCheckAMDType(t *testing.T) {
 		})
 	}
 }
+
+func TestDevices_Fit_ComputeQueues(t *testing.T) {
+	dev := InitAMDGPUDevice(AMDConfig{ResourceCountName: "amd.com/gpu"})
+	newDevs := func(used int32, info map[string]any) []*device.DeviceUsage {
+		return []*device.DeviceUsage{{
+			ID: "dev-0", Used: used, Count: 8, Totalmem: 1000, Totalcore: 100,
+			Type: AMDDevice, Health: true, CustomInfo: info,
+		}}
+	}
+	req := device.ContainerDeviceRequest{Nums: 1, Type: AMDDevice, Memreq: 100, Coresreq: 50}
+	podWith := func(annos map[string]string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: annos}}
+	}
+	queues := map[string]any{ComputeQueuesCustomInfo: float64(8)}
+
+	tests := []struct {
+		name   string
+		used   int32
+		info   map[string]any
+		annos  map[string]string
+		wantOK bool
+	}{
+		{"within queue capacity", 1, queues, map[string]string{AMDComputeQueues: "4"}, true},
+		{"queue capacity exhausted", 2, queues, map[string]string{AMDComputeQueues: "4"}, false},
+		{"one container always admitted", 0, map[string]any{ComputeQueuesCustomInfo: float64(4)}, map[string]string{AMDComputeQueues: "5"}, true},
+		{"second container over capacity", 1, map[string]any{ComputeQueuesCustomInfo: float64(4)}, map[string]string{AMDComputeQueues: "5"}, false},
+		{"no annotation keeps time-slicing only", 5, queues, nil, true},
+		{"no reported capacity keeps time-slicing only", 5, nil, map[string]string{AMDComputeQueues: "4"}, true},
+		{"invalid annotation ignored", 5, queues, map[string]string{AMDComputeQueues: "abc"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ok, _, _ := dev.Fit(newDevs(tt.used, tt.info), req, podWith(tt.annos), &device.NodeInfo{}, &device.PodDevices{})
+			assert.Equal(t, tt.wantOK, ok)
+		})
+	}
+}

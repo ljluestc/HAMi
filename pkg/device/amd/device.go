@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
@@ -50,6 +51,13 @@ const (
 	AMDAssignedNode    = "amd.com/predicate-node"
 	NodeLockAMD        = "hami.io/mutex.lock"
 	RegisterAnnos      = "hami.io/node-amd-register"
+	// AMDComputeQueues is the pod annotation stating how many compute queues
+	// (HQD slots) each process of the pod is expected to use. When set, the
+	// scheduler limits sharing on cards that report their queue capacity.
+	AMDComputeQueues = "amd.com/compute-queues"
+	// ComputeQueuesCustomInfo is the DeviceInfo.CustomInfo key under which the
+	// node registers the number of user compute HQD slots of a card.
+	ComputeQueuesCustomInfo = "computeQueues"
 )
 
 type AMDConfig struct {
@@ -169,6 +177,38 @@ func checkAMDType(annos map[string]string, cardType string) bool {
 		}
 	}
 	return true
+}
+
+// queueShareLimit returns the number of containers that may share the card
+// without oversubscribing its compute-queue (HQD) slots. ok is false when the
+// pod declares no queue usage or the card reports no capacity, in which case
+// only the time-slicing count applies.
+func queueShareLimit(annos map[string]string, d device.DeviceUsage) (limit int32, ok bool) {
+	raw, found := annos[AMDComputeQueues]
+	if !found {
+		return 0, false
+	}
+	perProc, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
+	if err != nil || perProc <= 0 {
+		klog.V(3).InfoS("ignoring invalid compute queue annotation", "value", raw)
+		return 0, false
+	}
+	var slots int64
+	switch v := d.CustomInfo[ComputeQueuesCustomInfo].(type) {
+	case float64:
+		slots = int64(v)
+	case int:
+		slots = int64(v)
+	case int32:
+		slots = int64(v)
+	case int64:
+		slots = v
+	}
+	if slots <= 0 {
+		return 0, false
+	}
+	// A card always admits one container, even if it alone exceeds the slots.
+	return int32(max(slots/perProc, 1)), true
 }
 
 func (dev *AMDDevices) checkType(annos map[string]string, d device.DeviceUsage, n device.ContainerDeviceRequest) (bool, bool, bool) {
@@ -311,6 +351,11 @@ func (amddevice *AMDDevices) Fit(devices []*device.DeviceUsage, request device.C
 		if dev.Count <= dev.Used {
 			reason[common.CardTimeSlicingExhausted]++
 			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used)
+			continue
+		}
+		if limit, ok := queueShareLimit(pod.GetAnnotations(), *dev); ok && dev.Used >= limit {
+			reason[common.CardTimeSlicingExhausted]++
+			klog.V(5).InfoS("compute queue capacity exhausted", "pod", klog.KObj(pod), "device", dev.ID, "queueShareLimit", limit, "used", dev.Used)
 			continue
 		}
 		if isMutex && dev.Used > 0 {
